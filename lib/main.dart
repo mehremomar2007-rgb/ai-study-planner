@@ -4,6 +4,22 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+// ═══════════ supabase_config.dart ═══════════
+
+// حط هنا بيانات مشروعك (Settings ← API). استخدم anon key بس، مش service_role أبداً.
+const kSupabaseUrl = 'https://mgssvmfhcepybwcvafxz.supabase.co';
+const kSupabaseAnonKey = 'sb_publishable_yFxYm5-zCet2HIfq_rU_yA_IkCMdZM9';
+
+/// بيبقى true لما Supabase.initialize تنجح.
+/// لو false التطبيق بيشتغل بالبيانات المحفوظة على الجهاز بس.
+bool supabaseReady = false;
+
+SupabaseClient get supabase => Supabase.instance.client;
+
+/// أي طلب للسيرفر بيتقطع بعد 10 ثواني بدل ما يفضل معلّق
+Future<T> _net<T>(Future<T> f) => f.timeout(const Duration(seconds: 10));
 
 // ═══════════ utils/dates.dart ═══════════
 
@@ -40,22 +56,21 @@ String dayName(DateTime d) => kDayNames[d.weekday - 1];
 
 String shortDate(DateTime d) => '${d.day}/${d.month}';
 
-
 // ═══════════ models/guard_level.dart ═══════════
 
 enum GuardLevel { safe, warning, over }
 
-
 // ═══════════ models/subject.dart ═══════════
 
-
 class SubjectModel {
+  final int? id; // رقم الصف في Supabase (null = مادة قديمة لسه ما اترفعتش)
   final String name;
   final String difficulty; // Easy, Medium, Hard
-  final double targetHours; // هدف المادة اليومي (مش الحد الآمن)
+  final double targetHours; // هدف المادة اليومي (بيتخزن في عمود max_hours)
   final DateTime createdAt; // عشان الخطة ما تحسبش أيام قبل إضافة المادة
 
   const SubjectModel({
+    this.id,
     required this.name,
     required this.difficulty,
     required this.targetHours,
@@ -71,13 +86,16 @@ class SubjectModel {
 
   SubjectModel copyWith({String? name, String? difficulty, double? targetHours}) =>
       SubjectModel(
+        id: id,
         name: name ?? this.name,
         difficulty: difficulty ?? this.difficulty,
         targetHours: targetHours ?? this.targetHours,
         createdAt: createdAt,
       );
 
+  // ───── التخزين المحلي (كاش على الجهاز) ─────
   Map<String, dynamic> toJson() => {
+        'id': id,
         'name': name,
         'difficulty': difficulty,
         'targetHours': targetHours,
@@ -85,6 +103,7 @@ class SubjectModel {
       };
 
   factory SubjectModel.fromJson(Map<String, dynamic> j) => SubjectModel(
+        id: (j['id'] as num?)?.toInt(),
         name: j['name'] as String,
         difficulty: j['difficulty'] as String,
         targetHours: (j['targetHours'] as num).toDouble(),
@@ -93,36 +112,102 @@ class SubjectModel {
             ? DateTime.parse(j['createdAt'] as String)
             : dateOnly(DateTime.now()),
       );
-}
 
+  // ───── Supabase (جدول subject) ─────
+  factory SubjectModel.fromRemote(Map<String, dynamic> r) => SubjectModel(
+        id: (r['id'] as num).toInt(),
+        name: r['name'] as String,
+        difficulty: (r['difficulty'] as String?) ?? 'Medium',
+        targetHours: ((r['max_hours'] as num?) ?? 2).toDouble(),
+        createdAt: dateOnly(DateTime.parse(r['created_at'] as String).toLocal()),
+      );
+}
 
 // ═══════════ models/study_session.dart ═══════════
 
 class StudySession {
+  final int? id; // null = لسه ما اترفعتش للسيرفر
   final String subject;
   final DateTime date;
   final double hours;
 
   const StudySession({
+    this.id,
     required this.subject,
     required this.date,
     required this.hours,
   });
 
-  Map<String, dynamic> toJson() =>
-      {'subject': subject, 'date': date.toIso8601String(), 'hours': hours};
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'subject': subject,
+        'date': date.toIso8601String(),
+        'hours': hours,
+      };
 
   factory StudySession.fromJson(Map<String, dynamic> j) => StudySession(
+        id: (j['id'] as num?)?.toInt(),
         subject: j['subject'] as String,
         date: DateTime.parse(j['date'] as String),
         hours: (j['hours'] as num).toDouble(),
       );
+
+  // ───── Supabase (جدول sessions) ─────
+  Map<String, dynamic> toRemote() => {
+        'subject': subject,
+        'hours': hours,
+        'session_date': date.toUtc().toIso8601String(),
+      };
+
+  factory StudySession.fromRemote(Map<String, dynamic> r) => StudySession(
+        id: (r['id'] as num).toInt(),
+        subject: r['subject'] as String,
+        date: DateTime.parse(r['session_date'] as String).toLocal(),
+        hours: (r['hours'] as num).toDouble(),
+      );
 }
 
+// ═══════════ models/task.dart ═══════════
+
+class TaskModel {
+  final int id;
+  final String title;
+  final bool isDone;
+  final String? subjectName;
+
+  const TaskModel({
+    required this.id,
+    required this.title,
+    required this.isDone,
+    this.subjectName,
+  });
+
+  TaskModel copyWith({bool? isDone}) => TaskModel(
+        id: id,
+        title: title,
+        isDone: isDone ?? this.isDone,
+        subjectName: subjectName,
+      );
+
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'title': title, 'isDone': isDone, 'subjectName': subjectName};
+
+  factory TaskModel.fromJson(Map<String, dynamic> j) => TaskModel(
+        id: (j['id'] as num).toInt(),
+        title: j['title'] as String,
+        isDone: (j['isDone'] as bool?) ?? false,
+        subjectName: j['subjectName'] as String?,
+      );
+
+  factory TaskModel.fromRemote(Map<String, dynamic> r) => TaskModel(
+        id: (r['id'] as num).toInt(),
+        title: (r['title'] as String?) ?? '',
+        isDone: (r['is_done'] as bool?) ?? false,
+        subjectName: r['subject_name'] as String?,
+      );
+}
 
 // ═══════════ services/planner.dart ═══════════
-
-
 
 /// خطة يوم واحد
 class DayPlan {
@@ -237,11 +322,7 @@ class Planner {
   }
 }
 
-
 // ═══════════ state/app_state.dart ═══════════
-
-
-
 
 class Suggestion {
   final String subject;
@@ -249,42 +330,33 @@ class Suggestion {
   const Suggestion(this.subject, this.remaining);
 }
 
-/// حالة التطبيق كلها + الحفظ الدائم.
-/// ChangeNotifier + ListenableBuilder بيعملوا نفس شغل Provider من غير أي حزمة زيادة.
+/// حالة التطبيق كلها.
+/// - الإعدادات (الحد اليومي، يوم الراحة، إعادة الجدولة) محفوظة على الجهاز.
+/// - المواد والجلسات في Supabase، ومعاهم كاش على الجهاز عشان التطبيق يفتح بسرعة وأوفلاين.
 class AppState extends ChangeNotifier {
   List<SubjectModel> subjects = [];
   List<StudySession> sessions = [];
+  List<TaskModel> tasks = [];
   double dailySafeCap = 4.5;
   int restDay = DateTime.friday; // 0 = مفيش يوم راحة
   bool autoReschedule = true;
 
-  List<SubjectModel> _defaultSubjects() {
-    final now = dateOnly(DateTime.now());
-    return [
-      SubjectModel(
-          name: 'System Analysis & Design',
-          difficulty: 'Hard',
-          targetHours: 2.0,
-          createdAt: now),
-      SubjectModel(
-          name: 'Data Structures & Algorithms',
-          difficulty: 'Medium',
-          targetHours: 2.5,
-          createdAt: now),
-    ];
-  }
+  bool syncing = false;
+  String? syncError;
+  bool _again = false;
 
-  // ───────────── التحميل والحفظ ─────────────
-  Future<void> load() async {
+  // ───────────── التحميل والحفظ المحلي ─────────────
+  Future<void> loadLocal() async {
     final prefs = await SharedPreferences.getInstance();
     dailySafeCap = prefs.getDouble('dailySafeCap') ?? 4.5;
     restDay = prefs.getInt('restDay') ?? DateTime.friday;
     autoReschedule = prefs.getBool('autoReschedule') ?? true;
     final subjectsRaw = prefs.getString('subjects');
     final sessionsRaw = prefs.getString('sessions');
+    final tasksRaw = prefs.getString('tasks');
     try {
       subjects = subjectsRaw == null
-          ? _defaultSubjects()
+          ? []
           : (jsonDecode(subjectsRaw) as List)
               .map((e) => SubjectModel.fromJson(e as Map<String, dynamic>))
               .toList();
@@ -296,10 +368,16 @@ class AppState extends ChangeNotifier {
       // نحتفظ بآخر 180 يوم بس عشان البيانات ما تكبرش
       final cutoff = DateTime.now().subtract(const Duration(days: 180));
       sessions = sessions.where((s) => s.date.isAfter(cutoff)).toList();
+      tasks = tasksRaw == null
+          ? []
+          : (jsonDecode(tasksRaw) as List)
+              .map((e) => TaskModel.fromJson(e as Map<String, dynamic>))
+              .toList();
     } catch (_) {
       // لو البيانات المحفوظة بايظة نبدأ من جديد بدل ما التطبيق يقع
-      subjects = _defaultSubjects();
+      subjects = [];
       sessions = [];
+      tasks = [];
     }
   }
 
@@ -312,11 +390,92 @@ class AppState extends ChangeNotifier {
         'subjects', jsonEncode(subjects.map((s) => s.toJson()).toList()));
     await prefs.setString(
         'sessions', jsonEncode(sessions.map((s) => s.toJson()).toList()));
+    await prefs.setString(
+        'tasks', jsonEncode(tasks.map((t) => t.toJson()).toList()));
   }
 
   void _changed() {
     notifyListeners();
     _save();
+  }
+
+  // ───────────── المزامنة مع Supabase ─────────────
+
+  /// بترفع أي حاجة لسه ما اترفعتش، وبعدين بتسحب آخر نسخة من السيرفر.
+  /// لو اتندهت وهي شغالة، بتعيد المزامنة مرة كمان بعد ما تخلص.
+  Future<void> refresh() async {
+    if (!supabaseReady) {
+      syncError = 'Supabase مش متضبط. البيانات محفوظة على الجهاز بس.';
+      notifyListeners();
+      return;
+    }
+    if (syncing) {
+      _again = true;
+      return;
+    }
+    syncing = true;
+    notifyListeners();
+    do {
+      _again = false;
+      await _syncOnce();
+    } while (_again);
+    syncing = false;
+    _changed();
+  }
+
+  Future<void> _syncOnce() async {
+    try {
+      await _pushLocalOnly();
+
+      final cutoff = DateTime.now().subtract(const Duration(days: 180));
+      final subjectRows =
+          await _net(supabase.from('subject').select().order('created_at'));
+      final sessionRows = await _net(supabase
+          .from('sessions')
+          .select()
+          .gte('session_date', cutoff.toUtc().toIso8601String())
+          .order('session_date'));
+      final taskRows =
+          await _net(supabase.from('tasks').select().order('created_at'));
+
+      tasks = taskRows.map(TaskModel.fromRemote).toList();
+      subjects = subjectRows.map(SubjectModel.fromRemote).toList();
+      // الجلسات اللي اتضافت أثناء المزامنة (لسه من غير id) بنحتفظ بيها
+      final inFlight = sessions.where((s) => s.id == null).toList();
+      sessions = [...sessionRows.map(StudySession.fromRemote), ...inFlight];
+      syncError = null;
+    } catch (e) {
+      debugPrint('Supabase sync failed: $e');
+      syncError = 'تعذّر الاتصال بالسيرفر. بنعرض آخر بيانات محفوظة.';
+    }
+  }
+
+  /// بترفع: (1) المواد القديمة اللي كانت محلية بس، (2) الجلسات اللي اتسجلت أوفلاين.
+  Future<void> _pushLocalOnly() async {
+    final legacy = subjects.where((s) => s.id == null).toList();
+    if (legacy.isNotEmpty) {
+      final rows = await _net(supabase.from('subject').select('name'));
+      final existing = {
+        for (final r in rows) (r['name'] as String).toLowerCase(),
+      };
+      for (final s in legacy) {
+        if (existing.contains(s.name.toLowerCase())) continue;
+        await _net(supabase.from('subject').insert({
+          'name': s.name,
+          'difficulty': s.difficulty,
+          'max_hours': s.targetHours,
+          'created_at': s.createdAt.toUtc().toIso8601String(),
+        }));
+      }
+    }
+
+    final pending = sessions.where((s) => s.id == null).toList();
+    for (final s in pending) {
+      final row =
+          await _net(supabase.from('sessions').insert(s.toRemote()).select().single());
+      final saved = StudySession.fromRemote(row);
+      sessions = sessions.map((x) => identical(x, s) ? saved : x).toList();
+    }
   }
 
   // ───────────── حسابات ─────────────
@@ -404,50 +563,159 @@ class AppState extends ChangeNotifier {
     _changed();
   }
 
-  void addSubject(String name, String difficulty, double target) {
-    subjects = [
-      ...subjects,
-      SubjectModel(
-        name: name,
-        difficulty: difficulty,
-        targetHours: target,
-        createdAt: dateOnly(DateTime.now()),
-      ),
-    ];
-    _changed();
+  /// بترجع true لو اتحفظت في Supabase. محتاجة نت عشان ناخد الـ id من السيرفر.
+  Future<bool> addSubject(String name, String difficulty, double target) async {
+    if (!supabaseReady) return false;
+    try {
+      final row = await _net(supabase
+          .from('subject')
+          .insert({'name': name, 'difficulty': difficulty, 'max_hours': target})
+          .select()
+          .single());
+      subjects = [...subjects, SubjectModel.fromRemote(row)];
+      _changed();
+      return true;
+    } catch (e) {
+      debugPrint('addSubject failed: $e');
+      return false;
+    }
   }
 
   /// تعديل مادة. لو الاسم اتغيّر، الجلسات القديمة بتتنقل للاسم الجديد.
-  void updateSubject(String oldName, SubjectModel updated) {
-    subjects = subjects.map((s) => s.name == oldName ? updated : s).toList();
-    if (oldName != updated.name) {
-      sessions = sessions
-          .map((s) => s.subject == oldName
-              ? StudySession(subject: updated.name, date: s.date, hours: s.hours)
-              : s)
-          .toList();
+  Future<bool> updateSubject(String oldName, SubjectModel updated) async {
+    if (!supabaseReady) return false;
+    try {
+      if (updated.id != null) {
+        await _net(supabase.from('subject').update({
+          'name': updated.name,
+          'difficulty': updated.difficulty,
+          'max_hours': updated.targetHours,
+        }).eq('id', updated.id!));
+        if (oldName != updated.name) {
+          await _net(supabase
+              .from('sessions')
+              .update({'subject': updated.name}).eq('subject', oldName));
+        }
+      }
+      subjects = subjects.map((s) => s.name == oldName ? updated : s).toList();
+      if (oldName != updated.name) {
+        sessions = sessions
+            .map((s) => s.subject == oldName
+                ? StudySession(
+                    id: s.id, subject: updated.name, date: s.date, hours: s.hours)
+                : s)
+            .toList();
+      }
+      _changed();
+      return true;
+    } catch (e) {
+      debugPrint('updateSubject failed: $e');
+      return false;
     }
-    _changed();
   }
 
-  void deleteSubject(String name) {
-    subjects = subjects.where((s) => s.name != name).toList();
-    _changed();
+  Future<bool> deleteSubject(SubjectModel subject) async {
+    if (!supabaseReady) return false;
+    try {
+      if (subject.id != null) {
+        await _net(supabase.from('subject').delete().eq('id', subject.id!));
+      }
+      subjects = subjects.where((s) => s.name != subject.name).toList();
+      _changed();
+      return true;
+    } catch (e) {
+      debugPrint('deleteSubject failed: $e');
+      return false;
+    }
   }
 
+  /// الجلسة بتظهر فوراً على الشاشة، وبعدين بتترفع للسيرفر في الخلفية.
+  /// لو النت واقع بتفضل محفوظة محلياً وبتترفع في أول مزامنة ناجحة.
   void addSession(String subject, double hours) {
     sessions = [
       ...sessions,
       StudySession(subject: subject, date: DateTime.now(), hours: hours),
     ];
     _changed();
+    unawaited(refresh());
+  }
+
+  // ───────────── المهام ─────────────
+  Future<bool> addTask(String title, String? subjectName) async {
+    if (!supabaseReady) return false;
+    try {
+      final row = await _net(supabase
+          .from('tasks')
+          .insert({'title': title, 'is_done': false, 'subject_name': subjectName})
+          .select()
+          .single());
+      tasks = [...tasks, TaskModel.fromRemote(row)];
+      _changed();
+      return true;
+    } catch (e) {
+      debugPrint('addTask failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> toggleTask(TaskModel t) async {
+    if (!supabaseReady) return false;
+    try {
+      await _net(supabase.from('tasks').update({'is_done': !t.isDone}).eq('id', t.id));
+      tasks = tasks.map((x) => x.id == t.id ? x.copyWith(isDone: !t.isDone) : x).toList();
+      _changed();
+      return true;
+    } catch (e) {
+      debugPrint('toggleTask failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> deleteTask(TaskModel t) async {
+    if (!supabaseReady) return false;
+    try {
+      await _net(supabase.from('tasks').delete().eq('id', t.id));
+      tasks = tasks.where((x) => x.id != t.id).toList();
+      _changed();
+      return true;
+    } catch (e) {
+      debugPrint('deleteTask failed: $e');
+      return false;
+    }
+  }
+
+  // ───────────── اسم المستخدم (متخزن في حسابه على Supabase) ─────────────
+  String? get userNameOrNull {
+    if (!supabaseReady) return null;
+    final n = supabase.auth.currentUser?.userMetadata?['name'];
+    return (n is String && n.trim().isNotEmpty) ? n.trim() : null;
+  }
+
+  String get userName => userNameOrNull ?? 'صديقي';
+
+  Future<bool> setUserName(String name) async {
+    if (!supabaseReady) return false;
+    try {
+      await _net(supabase.auth.updateUser(UserAttributes(data: {'name': name})));
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('setUserName failed: $e');
+      return false;
+    }
+  }
+
+  /// بتتندّه لما المستخدم يسجّل خروج، عشان بياناته ما تفضلش ظاهرة على الجهاز
+  Future<void> clearData() async {
+    subjects = [];
+    sessions = [];
+    tasks = [];
+    syncError = null;
+    _changed();
   }
 }
 
-
 // ═══════════ theme.dart ═══════════
-
-
 
 const kBg = Color(0xFF0b1326);
 const kCard = Color(0xFF171f33);
@@ -524,10 +792,7 @@ BoxDecoration cardDecoration([Color? borderColor]) => BoxDecoration(
       border: Border.all(color: (borderColor ?? kBorder).withValues(alpha: 0.5)),
     );
 
-
 // ═══════════ widgets/dialogs.dart ═══════════
-
-
 
 Future<void> showCapDialog(BuildContext context, AppState state) {
   final controller = TextEditingController(text: state.dailySafeCap.toString());
@@ -575,6 +840,7 @@ Future<void> showSubjectDialog(
   final targetController =
       TextEditingController(text: (existing?.targetHours ?? 2.0).toString());
   var difficulty = existing?.difficulty ?? 'Medium';
+  var saving = false;
 
   return showDialog(
     context: context,
@@ -623,36 +889,106 @@ Future<void> showSubjectDialog(
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+          TextButton(
+              onPressed: saving ? null : () => Navigator.pop(ctx),
+              child: const Text('إلغاء')),
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: kGreen),
-            onPressed: () {
-              final name = nameController.text.trim();
-              final target = parseNumber(targetController.text);
-              if (name.isEmpty) {
-                showSnack(ctx, 'اكتب اسم المادة');
-                return;
-              }
-              final clash = state.subjects.any((s) =>
-                  s.name.toLowerCase() == name.toLowerCase() && s.name != existing?.name);
-              if (clash) {
-                showSnack(ctx, 'المادة دي موجودة بالفعل');
-                return;
-              }
-              if (target == null || target <= 0 || target > 12) {
-                showSnack(ctx, 'الهدف لازم يكون أكبر من 0 وأقل من 12 ساعة');
-                return;
-              }
-              if (existing != null) {
-                state.updateSubject(
-                  existing.name,
-                  existing.copyWith(name: name, difficulty: difficulty, targetHours: target),
-                );
-              } else {
-                state.addSubject(name, difficulty, target);
-              }
-              Navigator.pop(ctx);
-            },
+            onPressed: saving
+                ? null
+                : () async {
+                    final name = nameController.text.trim();
+                    final target = parseNumber(targetController.text);
+                    if (name.isEmpty) {
+                      showSnack(ctx, 'اكتب اسم المادة');
+                      return;
+                    }
+                    final clash = state.subjects.any((s) =>
+                        s.name.toLowerCase() == name.toLowerCase() &&
+                        s.name != existing?.name);
+                    if (clash) {
+                      showSnack(ctx, 'المادة دي موجودة بالفعل');
+                      return;
+                    }
+                    if (target == null || target <= 0 || target > 12) {
+                      showSnack(ctx, 'الهدف لازم يكون أكبر من 0 وأقل من 12 ساعة');
+                      return;
+                    }
+
+                    setLocal(() => saving = true);
+                    final ok = existing != null
+                        ? await state.updateSubject(
+                            existing.name,
+                            existing.copyWith(
+                                name: name, difficulty: difficulty, targetHours: target),
+                          )
+                        : await state.addSubject(name, difficulty, target);
+                    if (!ctx.mounted) return;
+                    if (ok) {
+                      Navigator.pop(ctx);
+                    } else {
+                      setLocal(() => saving = false);
+                      showSnack(ctx, 'ما اتحفظتش. اتأكد من النت ومن إعدادات Supabase.');
+                    }
+                  },
+            child: saving
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: kBg),
+                  )
+                : const Text('حفظ', style: TextStyle(color: kBg)),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+/// نافذة تغيير الاسم (بيتخزن في حساب المستخدم)
+Future<void> showNameDialog(BuildContext context, AppState state) {
+  final controller = TextEditingController(text: state.userNameOrNull ?? '');
+  var saving = false;
+  return showDialog(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setLocal) => AlertDialog(
+        backgroundColor: kCard,
+        title: const Text('اسمك', style: TextStyle(color: Colors.white)),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 30,
+          style: const TextStyle(color: Colors.white),
+          decoration: const InputDecoration(
+            labelText: 'اكتب اسمك',
+            labelStyle: TextStyle(color: kMuted),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: saving ? null : () => Navigator.pop(ctx),
+              child: const Text('إلغاء')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: kGreen),
+            onPressed: saving
+                ? null
+                : () async {
+                    final name = controller.text.trim();
+                    if (name.isEmpty) {
+                      showSnack(ctx, 'اكتب اسمك');
+                      return;
+                    }
+                    setLocal(() => saving = true);
+                    final ok = await state.setUserName(name);
+                    if (!ctx.mounted) return;
+                    if (ok) {
+                      Navigator.pop(ctx);
+                    } else {
+                      setLocal(() => saving = false);
+                      showSnack(ctx, 'ما اتحفظش. اتأكد من النت.');
+                    }
+                  },
             child: const Text('حفظ', style: TextStyle(color: kBg)),
           ),
         ],
@@ -661,11 +997,223 @@ Future<void> showSubjectDialog(
   );
 }
 
+/// نافذة إضافة مهمة جديدة
+Future<void> showTaskDialog(BuildContext context, AppState state) {
+  final titleController = TextEditingController();
+  String? subject;
+  var saving = false;
+  return showDialog(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setLocal) => AlertDialog(
+        backgroundColor: kCard,
+        title: const Text('مهمة جديدة', style: TextStyle(color: Colors.white)),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextField(
+                controller: titleController,
+                autofocus: true,
+                style: const TextStyle(color: Colors.white),
+                decoration: const InputDecoration(
+                  labelText: 'المهمة (مثال: حل شيت 3)',
+                  labelStyle: TextStyle(color: kMuted),
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text('المادة (اختياري)', style: TextStyle(fontSize: 12, color: kMuted)),
+              DropdownButton<String?>(
+                isExpanded: true,
+                dropdownColor: kCard,
+                value: subject,
+                items: [
+                  const DropdownMenuItem<String?>(
+                    value: null,
+                    child: Text('بدون مادة', style: TextStyle(color: Colors.white)),
+                  ),
+                  ...state.subjects.map((s) => DropdownMenuItem<String?>(
+                        value: s.name,
+                        child: Text(s.name, style: const TextStyle(color: Colors.white)),
+                      )),
+                ],
+                onChanged: (v) => setLocal(() => subject = v),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: saving ? null : () => Navigator.pop(ctx),
+              child: const Text('إلغاء')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: kGreen),
+            onPressed: saving
+                ? null
+                : () async {
+                    final title = titleController.text.trim();
+                    if (title.isEmpty) {
+                      showSnack(ctx, 'اكتب المهمة');
+                      return;
+                    }
+                    setLocal(() => saving = true);
+                    final ok = await state.addTask(title, subject);
+                    if (!ctx.mounted) return;
+                    if (ok) {
+                      Navigator.pop(ctx);
+                    } else {
+                      setLocal(() => saving = false);
+                      showSnack(ctx, 'ما اتحفظتش. اتأكد من النت.');
+                    }
+                  },
+            child: const Text('إضافة', style: TextStyle(color: kBg)),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+/// نسيت كلمة السر: بنبعت كود على الإيميل، وبعدين المستخدم يكتب الكود وكلمة سر جديدة
+Future<void> showResetPasswordDialog(BuildContext context, String initialEmail) {
+  final emailController = TextEditingController(text: initialEmail);
+  final codeController = TextEditingController();
+  final passwordController = TextEditingController();
+  var codeSent = false;
+  var loading = false;
+  String? error;
+
+  return showDialog(
+    context: context,
+    barrierDismissible: false,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setLocal) {
+        Future<void> run(Future<void> Function() job) async {
+          setLocal(() {
+            loading = true;
+            error = null;
+          });
+          try {
+            await job();
+          } on AuthException catch (e) {
+            if (ctx.mounted) setLocal(() => error = e.message);
+          } catch (e) {
+            debugPrint('reset failed: $e');
+            if (ctx.mounted) setLocal(() => error = 'حصلت مشكلة في الاتصال. حاول تاني.');
+          }
+          if (ctx.mounted) setLocal(() => loading = false);
+        }
+
+        Future<void> sendCode() async {
+          final email = emailController.text.trim();
+          if (!email.contains('@')) {
+            setLocal(() => error = 'اكتب إيميل صحيح');
+            return;
+          }
+          await run(() async {
+            await supabase.auth.resetPasswordForEmail(email);
+            if (ctx.mounted) setLocal(() => codeSent = true);
+          });
+        }
+
+        Future<void> confirm() async {
+          final code = codeController.text.trim();
+          final pass = passwordController.text;
+          if (code.isEmpty) {
+            setLocal(() => error = 'اكتب الكود اللي وصلك على الإيميل');
+            return;
+          }
+          if (pass.length < 6) {
+            setLocal(() => error = 'كلمة السر لازم تكون 6 حروف على الأقل');
+            return;
+          }
+          await run(() async {
+            await supabase.auth.verifyOTP(
+              type: OtpType.recovery,
+              email: emailController.text.trim(),
+              token: code,
+            );
+            await supabase.auth.updateUser(UserAttributes(password: pass));
+            if (ctx.mounted) Navigator.pop(ctx);
+          });
+        }
+
+        return AlertDialog(
+          backgroundColor: kCard,
+          title: const Text('نسيت كلمة السر', style: TextStyle(color: Colors.white)),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: emailController,
+                  enabled: !codeSent,
+                  keyboardType: TextInputType.emailAddress,
+                  textDirection: TextDirection.ltr,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: const InputDecoration(
+                    labelText: 'الإيميل',
+                    labelStyle: TextStyle(color: kMuted),
+                  ),
+                ),
+                if (codeSent) ...[
+                  const SizedBox(height: 12),
+                  const Text('بعتنالك كود على الإيميل. اكتبه هنا مع كلمة السر الجديدة.',
+                      style: TextStyle(fontSize: 12, color: kMuted, height: 1.4)),
+                  TextField(
+                    controller: codeController,
+                    keyboardType: TextInputType.number,
+                    textDirection: TextDirection.ltr,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: const InputDecoration(
+                      labelText: 'الكود',
+                      labelStyle: TextStyle(color: kMuted),
+                    ),
+                  ),
+                  TextField(
+                    controller: passwordController,
+                    obscureText: true,
+                    textDirection: TextDirection.ltr,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: const InputDecoration(
+                      labelText: 'كلمة السر الجديدة',
+                      labelStyle: TextStyle(color: kMuted),
+                    ),
+                  ),
+                ],
+                if (error != null) ...[
+                  const SizedBox(height: 12),
+                  Text(error!, style: const TextStyle(fontSize: 12, color: kRed)),
+                ],
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: loading ? null : () => Navigator.pop(ctx),
+                child: const Text('إلغاء')),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: kGreen),
+              onPressed: loading ? null : (codeSent ? confirm : sendCode),
+              child: loading
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: kBg),
+                    )
+                  : Text(codeSent ? 'تأكيد' : 'ابعت الكود',
+                      style: const TextStyle(color: kBg)),
+            ),
+          ],
+        );
+      },
+    ),
+  );
+}
 
 // ═══════════ widgets/week_chart.dart ═══════════
-
-
-
 
 /// رسم بياني بسيط لآخر 7 أيام (من غير أي حزمة خارجية).
 /// الخط الأحمر = الحد الآمن اليومي.
@@ -761,10 +1309,7 @@ class WeekChart extends StatelessWidget {
   }
 }
 
-
 // ═══════════ screens/dashboard_tab.dart ═══════════
-
-
 
 class DashboardTab extends StatelessWidget {
   final AppState state;
@@ -796,6 +1341,30 @@ class DashboardTab extends StatelessWidget {
       ),
     );
   }
+
+  Widget _syncBanner() => Container(
+        margin: const EdgeInsets.only(bottom: 16),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: kOrange.withValues(alpha: 0.1),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: kOrange.withValues(alpha: 0.4)),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.cloud_off_rounded, color: kOrange, size: 18),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(state.syncError ?? '',
+                  style: const TextStyle(fontSize: 12, color: kOrange, height: 1.4)),
+            ),
+            TextButton(
+              onPressed: () => state.refresh(),
+              child: const Text('إعادة المحاولة', style: TextStyle(fontSize: 12)),
+            ),
+          ],
+        ),
+      );
 
   Widget _suggestionCard() {
     if (state.subjects.isEmpty) return const SizedBox.shrink();
@@ -839,32 +1408,50 @@ class DashboardTab extends StatelessWidget {
                   children: [
                     CircleAvatar(
                       backgroundColor: kGreen.withValues(alpha: 0.2),
-                      child: const Text('O',
-                          style: TextStyle(color: kGreen, fontWeight: FontWeight.bold)),
+                      child: Text(
+                          String.fromCharCode(state.userName.runes.first).toUpperCase(),
+                          style: const TextStyle(
+                              color: kGreen, fontWeight: FontWeight.bold)),
                     ),
                     const SizedBox(width: 12),
-                    const Column(
+                    Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text('StudyPace',
+                        const Text('StudyPace',
                             style: TextStyle(
                                 fontSize: 18,
                                 fontWeight: FontWeight.bold,
                                 color: Colors.white)),
-                        Text('عمر • سنة تانية حاسبات',
-                            style: TextStyle(fontSize: 12, color: kMuted)),
+                        InkWell(
+                          onTap: supabaseReady ? () => showNameDialog(context, state) : null,
+                          child: Text('${state.userName} • سنة تانية حاسبات ✎',
+                              style: const TextStyle(fontSize: 12, color: kMuted)),
+                        ),
                       ],
                     ),
                   ],
                 ),
-                IconButton(
-                  tooltip: 'تعديل الحد اليومي',
-                  onPressed: () => showCapDialog(context, state),
-                  icon: const Icon(Icons.tune_rounded, color: kMuted),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      tooltip: 'تعديل الحد اليومي',
+                      onPressed: () => showCapDialog(context, state),
+                      icon: const Icon(Icons.tune_rounded, color: kMuted),
+                    ),
+                    if (supabaseReady)
+                      IconButton(
+                        tooltip: 'تسجيل الخروج',
+                        onPressed: () => supabase.auth.signOut(),
+                        icon: const Icon(Icons.logout_rounded, color: kMuted),
+                      ),
+                  ],
                 ),
               ],
             ),
             const SizedBox(height: 16),
+
+            if (state.syncError != null) _syncBanner(),
 
             // الملخص اليومي + السلسلة
             Container(
@@ -878,7 +1465,7 @@ class DashboardTab extends StatelessWidget {
                           fontSize: 16, fontWeight: FontWeight.bold, color: kGreen)),
                   const SizedBox(height: 8),
                   Text(
-                    'مرحباً يا عمر. عندك ${state.subjects.length} مواد. '
+                    'مرحباً يا ${state.userName}. عندك ${state.subjects.length} مواد. '
                     'ذاكرت النهاردة ${fmtHours(state.todayHours)}.',
                     style: const TextStyle(fontSize: 13, color: kMuted, height: 1.4),
                   ),
@@ -1023,10 +1610,7 @@ class DashboardTab extends StatelessWidget {
   }
 }
 
-
 // ═══════════ screens/plan_tab.dart ═══════════
-
-
 
 class PlanTab extends StatelessWidget {
   final AppState state;
@@ -1246,10 +1830,7 @@ class PlanTab extends StatelessWidget {
   }
 }
 
-
 // ═══════════ screens/subjects_tab.dart ═══════════
-
-
 
 class SubjectsTab extends StatelessWidget {
   final AppState state;
@@ -1271,7 +1852,11 @@ class SubjectsTab extends StatelessWidget {
         ],
       ),
     );
-    if (ok == true) state.deleteSubject(s.name);
+    if (ok != true) return;
+    final deleted = await state.deleteSubject(s);
+    if (!deleted && context.mounted) {
+      showSnack(context, 'ما اتحذفتش. اتأكد من النت.');
+    }
   }
 
   @override
@@ -1284,6 +1869,17 @@ class SubjectsTab extends StatelessWidget {
           backgroundColor: Colors.transparent,
           title: const Text('المواد', style: TextStyle(fontSize: 18)),
           actions: [
+            IconButton(
+              tooltip: 'مزامنة',
+              onPressed: state.syncing ? null : () => state.refresh(),
+              icon: state.syncing
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: kMuted),
+                    )
+                  : const Icon(Icons.sync_rounded, color: kMuted),
+            ),
             IconButton(
               tooltip: 'إضافة مادة',
               icon: const Icon(Icons.add_circle, color: kGreen, size: 28),
@@ -1352,11 +1948,7 @@ class SubjectsTab extends StatelessWidget {
   }
 }
 
-
 // ═══════════ screens/focus_tab.dart ═══════════
-
-
-
 
 enum PomoPhase { focus, shortBreak, longBreak }
 
@@ -1745,10 +2337,111 @@ class _FocusTabState extends State<FocusTab> with WidgetsBindingObserver {
   }
 }
 
+// ═══════════ screens/tasks_tab.dart ═══════════
+
+class TasksTab extends StatelessWidget {
+  final AppState state;
+  const TasksTab({super.key, required this.state});
+
+  Widget _taskCard(BuildContext context, TaskModel t) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: cardDecoration(t.isDone ? kGreen : null),
+      child: Row(
+        children: [
+          Checkbox(
+            value: t.isDone,
+            activeColor: kGreen,
+            checkColor: kBg,
+            onChanged: (_) async {
+              final ok = await state.toggleTask(t);
+              if (!ok && context.mounted) showSnack(context, 'ما اتعدلتش. اتأكد من النت.');
+            },
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  t.title,
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: t.isDone ? kMuted : Colors.white,
+                    decoration: t.isDone ? TextDecoration.lineThrough : null,
+                  ),
+                ),
+                if (t.subjectName != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(t.subjectName!,
+                        style: const TextStyle(fontSize: 11, color: kGreen)),
+                  ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: 'حذف',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.delete_outline, color: kMuted, size: 20),
+            onPressed: () async {
+              final ok = await state.deleteTask(t);
+              if (!ok && context.mounted) showSnack(context, 'ما اتحذفتش. اتأكد من النت.');
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: state,
+      builder: (context, _) {
+        final pending = state.tasks.where((t) => !t.isDone).toList();
+        final done = state.tasks.where((t) => t.isDone).toList();
+        final ordered = [...pending, ...done];
+
+        return Scaffold(
+          backgroundColor: Colors.transparent,
+          appBar: AppBar(
+            backgroundColor: Colors.transparent,
+            title: const Text('المهام', style: TextStyle(fontSize: 18)),
+            actions: [
+              IconButton(
+                tooltip: 'مهمة جديدة',
+                icon: const Icon(Icons.add_circle, color: kGreen, size: 28),
+                onPressed: () => showTaskDialog(context, state),
+              ),
+            ],
+          ),
+          body: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              if (ordered.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.only(top: 40),
+                  child: Center(
+                    child: Text('اضغط (+) لإضافة أول مهمة.', style: TextStyle(color: kMuted)),
+                  ),
+                )
+              else
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Text('باقي ${pending.length} من ${ordered.length}',
+                      style: const TextStyle(fontSize: 12, color: kMuted)),
+                ),
+              ...ordered.map((t) => _taskCard(context, t)),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
 
 // ═══════════ screens/app_shell.dart ═══════════
-
-
 
 class AppShell extends StatefulWidget {
   final AppState state;
@@ -1773,6 +2466,7 @@ class _AppShellState extends State<AppShell> {
             PlanTab(state: widget.state),
             SubjectsTab(state: widget.state),
             FocusTab(state: widget.state),
+            TasksTab(state: widget.state),
           ],
         ),
       ),
@@ -1791,6 +2485,7 @@ class _AppShellState extends State<AppShell> {
             _navItem(1, Icons.calendar_today_rounded, 'الخطة'),
             _navItem(2, Icons.menu_book_rounded, 'المواد'),
             _navItem(3, Icons.spa_rounded, 'التركيز'),
+            _navItem(4, Icons.checklist_rounded, 'المهام'),
           ],
         ),
       ),
@@ -1830,17 +2525,282 @@ class _AppShellState extends State<AppShell> {
   }
 }
 
+// ═══════════ screens/auth_gate.dart ═══════════
+
+/// بيقرر نعرض شاشة الدخول ولا التطبيق نفسه حسب حالة تسجيل الدخول
+class AuthGate extends StatefulWidget {
+  final AppState state;
+  const AuthGate({super.key, required this.state});
+
+  @override
+  State<AuthGate> createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<AuthGate> {
+  StreamSubscription<AuthState>? _sub;
+  Session? _session;
+
+  @override
+  void initState() {
+    super.initState();
+    if (supabaseReady) {
+      _session = supabase.auth.currentSession;
+      _sub = supabase.auth.onAuthStateChange.listen((data) {
+        if (!mounted) return;
+        final wasIn = _session != null;
+        final now = data.session;
+        setState(() => _session = now);
+        if (now != null && !wasIn) widget.state.refresh(); // لسه داخل
+        if (now == null && wasIn) widget.state.clearData(); // لسه خارج
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // لو Supabase مش متضبط التطبيق بيشتغل محلياً من غير دخول
+    if (!supabaseReady || _session != null) return AppShell(state: widget.state);
+    return const LoginScreen();
+  }
+}
+
+// ═══════════ screens/login_screen.dart ═══════════
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final emailController = TextEditingController();
+  final passwordController = TextEditingController();
+  final nameController = TextEditingController();
+  bool isSignUp = false;
+  bool loading = false;
+  String? message;
+  Color messageColor = kRed;
+
+  @override
+  void dispose() {
+    emailController.dispose();
+    passwordController.dispose();
+    nameController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final email = emailController.text.trim();
+    final password = passwordController.text;
+    if (email.isEmpty || !email.contains('@')) {
+      setState(() {
+        message = 'اكتب إيميل صحيح';
+        messageColor = kRed;
+      });
+      return;
+    }
+    if (password.length < 6) {
+      setState(() {
+        message = 'كلمة السر لازم تكون 6 حروف على الأقل';
+        messageColor = kRed;
+      });
+      return;
+    }
+
+    setState(() {
+      loading = true;
+      message = null;
+    });
+    try {
+      if (isSignUp) {
+        final name = nameController.text.trim();
+        final res = await supabase.auth.signUp(
+          email: email,
+          password: password,
+          data: name.isEmpty ? null : {'name': name},
+        );
+        // لو تأكيد الإيميل شغال في Supabase مش هيرجع session
+        if (res.session == null && mounted) {
+          setState(() {
+            message = 'اتبعتلك إيميل تأكيد. افتحه وبعدين سجّل دخول.';
+            messageColor = kGreen;
+            isSignUp = false;
+          });
+        }
+      } else {
+        await supabase.auth.signInWithPassword(email: email, password: password);
+      }
+      // لو نجح الدخول، AuthGate هو اللي بيفتح التطبيق لوحده
+    } on AuthException catch (e) {
+      if (mounted) {
+        setState(() {
+          message = e.message;
+          messageColor = kRed;
+        });
+      }
+    } catch (e) {
+      debugPrint('auth failed: $e');
+      if (mounted) {
+        setState(() {
+          message = 'حصلت مشكلة في الاتصال. اتأكد من النت وحاول تاني.';
+          messageColor = kRed;
+        });
+      }
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 400),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Icon(Icons.spa_rounded, color: kGreen, size: 48),
+                  const SizedBox(height: 12),
+                  const Text('StudyPace',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                          fontSize: 26, fontWeight: FontWeight.bold, color: Colors.white)),
+                  const SizedBox(height: 4),
+                  Text(isSignUp ? 'أنشئ حساب جديد' : 'سجّل دخول',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 14, color: kMuted)),
+                  const SizedBox(height: 28),
+                  if (isSignUp) ...[
+                    TextField(
+                      controller: nameController,
+                      style: const TextStyle(color: Colors.white),
+                      decoration: const InputDecoration(
+                        labelText: 'اسمك',
+                        labelStyle: TextStyle(color: kMuted),
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                  ],
+                  TextField(
+                    controller: emailController,
+                    keyboardType: TextInputType.emailAddress,
+                    textDirection: TextDirection.ltr,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: const InputDecoration(
+                      labelText: 'الإيميل',
+                      labelStyle: TextStyle(color: kMuted),
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: passwordController,
+                    obscureText: true,
+                    textDirection: TextDirection.ltr,
+                    style: const TextStyle(color: Colors.white),
+                    onSubmitted: (_) => loading ? null : _submit(),
+                    decoration: const InputDecoration(
+                      labelText: 'كلمة السر',
+                      labelStyle: TextStyle(color: kMuted),
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  if (!isSignUp)
+                    Align(
+                      alignment: AlignmentDirectional.centerStart,
+                      child: TextButton(
+                        onPressed: loading
+                            ? null
+                            : () => showResetPasswordDialog(
+                                context, emailController.text.trim()),
+                        child: const Text('نسيت كلمة السر؟',
+                            style: TextStyle(color: kMuted, fontSize: 12)),
+                      ),
+                    ),
+                  if (message != null) ...[
+                    const SizedBox(height: 12),
+                    Text(message!,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 12, color: messageColor, height: 1.4)),
+                  ],
+                  const SizedBox(height: 20),
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: kGreen,
+                      foregroundColor: kBg,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape:
+                          RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                    onPressed: loading ? null : _submit,
+                    child: loading
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: kBg),
+                          )
+                        : Text(isSignUp ? 'إنشاء حساب' : 'دخول',
+                            style: const TextStyle(fontWeight: FontWeight.bold)),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton(
+                    onPressed: loading
+                        ? null
+                        : () => setState(() {
+                              isSignUp = !isSignUp;
+                              message = null;
+                            }),
+                    child: Text(
+                      isSignUp ? 'عندي حساب بالفعل' : 'مفيش حساب؟ أنشئ واحد',
+                      style: const TextStyle(color: kMuted, fontSize: 13),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 // ═══════════ main.dart ═══════════
 
-
-
-
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // لو المفاتيح لسه placeholder، التطبيق بيشتغل محلياً من غير ما يقع
+  final configured = !kSupabaseUrl.contains('YOUR_PROJECT_ID') &&
+      !kSupabaseAnonKey.contains('YOUR_ANON');
+  if (configured) {
+    try {
+      await Supabase.initialize(url: kSupabaseUrl, anonKey: kSupabaseAnonKey);
+      supabaseReady = true;
+    } catch (e) {
+      debugPrint('Supabase.initialize failed: $e');
+    }
+  }
+
   final state = AppState();
-  await state.load();
+  await state.loadLocal(); // بيانات الجهاز تظهر فوراً
   runApp(StudyPaceApp(state: state));
+  // نسحب آخر نسخة من Supabase في الخلفية (بس لو المستخدم داخل بالفعل)
+  if (supabaseReady && supabase.auth.currentSession != null) {
+    unawaited(state.refresh());
+  }
 }
 
 class StudyPaceApp extends StatelessWidget {
@@ -1857,7 +2817,7 @@ class StudyPaceApp extends StatelessWidget {
       // واجهة عربية بالكامل: الاتجاه من اليمين لليسار
       builder: (context, child) =>
           Directionality(textDirection: TextDirection.rtl, child: child!),
-      home: AppShell(state: state),
+      home: AuthGate(state: state),
     );
   }
 }
