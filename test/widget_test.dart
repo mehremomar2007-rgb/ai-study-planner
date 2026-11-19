@@ -1,14 +1,19 @@
-import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/material.dart';
-// استخدام مسار نسبي مباشر بيلغي أي مشاكل في اسم المشروع
-import '../lib/main.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'package:ai_study_planner/app/studypace_app.dart';
+import 'package:ai_study_planner/state/app_state.dart';
 
 void main() {
-  testWidgets('التطبيق يعمل بشكل صحيح', (tester) async {
-    // بناء التطبيق
-    await tester.pumpWidget(const StudyPaceApp());
+  testWidgets('StudyPace app works correctly', (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final state = AppState();
 
-    // التحقق من ظهور الواجهة الرئيسية
+    await tester.pumpWidget(
+      StudyPaceApp(state: state),
+    );
+
     expect(find.byType(MaterialApp), findsOneWidget);
   });
 }
